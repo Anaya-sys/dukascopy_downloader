@@ -133,7 +133,7 @@ class DownloadOrchestrator:
         self._scraper     = GitHubScraper()
         self._decode_sem = threading.BoundedSemaphore(3)
         self._checkpoint_buf: list[tuple] = []
-        self._checkpoint_buf_lock = threading.Lock()
+        self._checkpoint_buf_lock = threading.RLock()  # RLock: permite re-entrada desde _flush_checkpoints (Bug C)
         self._CHECKPOINT_BATCH = 15
 
     # ── Task builder ──────────────────────────────────────────────────────
@@ -172,7 +172,7 @@ class DownloadOrchestrator:
                return
             for sym, tf, d in self._checkpoint_buf:
                self._checkpoint.update(sym, tf, d)
-               self._checkpoint_buf.clear()
+            self._checkpoint_buf.clear()  # Bug B fix: fuera del for; se ejecuta tras persistir TODOS los items
     # ── Single task executor ──────────────────────────────────────────────
 
     def _execute_task(self, task: Task) -> None:
@@ -207,7 +207,7 @@ class DownloadOrchestrator:
             else:
                 if dt < date.today():
                    with self._checkpoint_buf_lock:
-                      self._checkpoint_buf.append((symbol, tf, last_of_month))
+                      self._checkpoint_buf.append((symbol, tf, dt))  # Bug A fix: dt, no last_of_month
                       self._flush_checkpoints()
 
         except ChunkDownloadError as exc:
@@ -263,6 +263,7 @@ class DownloadOrchestrator:
         if raw is None:
             return
         df = self._decoder.decode(raw, download_tf, factor, base_dt)
+        del raw  # Bug E fix: liberar bytes comprimidos en TODOS los paths, incluso df vacío
         if df.empty:
             return
 
@@ -274,7 +275,6 @@ class DownloadOrchestrator:
 
         self._csv.write(symbol, tf, df)
         del df
-        del raw
         gc.collect()
 
     # ── Main entry point ──────────────────────────────────────────────────

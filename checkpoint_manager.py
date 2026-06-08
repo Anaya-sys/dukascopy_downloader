@@ -20,7 +20,7 @@ class CheckpointManager:
 
     def __init__(self, base_path: Path) -> None:
         self._path  = Path(base_path) / "progress.json"
-        self._lock  = threading.Lock()
+        self._lock  = threading.RLock()  # RLock: reentrant; previene deadlock si se llama desde contexto locked
         self._data: dict[str, dict[str, str]] = self._load()
 
     # ── Private helpers ───────────────────────────────────────────────────

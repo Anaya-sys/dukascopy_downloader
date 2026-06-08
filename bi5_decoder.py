@@ -72,19 +72,11 @@ class Bi5Decoder:
         if base_dt.tzinfo is None:
             raise ValueError("base_dt must be timezone-aware (pass a UTC datetime)")
 
-        if timeframe in _TICK_TIMEFRAMES:
-            cols   = ["timestamp", "ask", "bid", "ask_volume", "bid_volume"]
-            fmt    = TICK_STRUCT_FMT
-            size   = TICK_RECORD_SIZE
-            is_tick = True
-        elif timeframe in _OHLCV_TIMEFRAMES:
-            cols   = ["timestamp", "open", "high", "low", "close", "volume"]
-            fmt    = OHLCV_STRUCT_FMT
-            size   = OHLCV_RECORD_SIZE
-            is_tick = False
-        else:
+        # Bug D fix: bloque único de asignación; eliminadas las asignaciones
+        # duplicadas de is_tick/cols/fmt/size del if/elif anterior (código muerto).
+        if timeframe not in _TICK_TIMEFRAMES and timeframe not in _OHLCV_TIMEFRAMES:
             raise ValueError(f"Unknown timeframe: {timeframe!r}. Valid: tick, m1, m15, h1, h4")
-        
+
         is_tick = timeframe in _TICK_TIMEFRAMES
         dtype   = _TICK_DTYPE if is_tick else _OHLCV_DTYPE
         cols    = ["timestamp","ask","bid","ask_volume","bid_volume"] if is_tick \
