@@ -32,8 +32,8 @@ Convención de rutas (espeja CsvWriter):
   OHLCV: {base}/{SYMBOL}/{tf_folder}/{SYMBOL}_{tf_folder}.parquet
   Tick:  {base}/{SYMBOL}/tick/{SYMBOL}_tick_{YYYY}_{MM}.parquet
 
-Fase 2B: compresión ZSTD nivel 1 (hardcoded).
-         La configurabilidad se añade en Fase 2C.
+Fase 2B: compresión ZSTD nivel 1.
+Fase 2C: nivel configurable vía config.PARQUET_COMPRESSION_LEVEL.
 
 Interfaz pública idéntica a CsvWriter:
   ParquetWriter(base_path)
@@ -161,6 +161,8 @@ class ParquetWriter:
         # Inyectar metadata en el schema
         schema_with_meta = schema.with_metadata(file_meta)
 
+        # BUG #7 FIX: pa.Table.from_pandas (CPU-bound) fuera del lock para no
+        # bloquear a otros workers mientras se hace la conversión en memoria.
         table = pa.Table.from_pandas(df, schema=schema_with_meta, preserve_index=False)
 
         with self._global_write_lock:
@@ -185,9 +187,17 @@ class ParquetWriter:
     def finalize(self, symbol: str, timeframe: str) -> None:
         """
         Para h1 y h4: lee el archivo acumulado, deduplica por timestamp,
-        ordena y lo sobreescribe atómicamente con Polars.
+        ordena y lo sobreescribe atómicamente preservando la file-level metadata.
 
         Para tick, m1 y m15: no-op (archivos atómicos por chunk).
+
+        BUG #2 FIX: Polars sink_parquet() no propaga la custom metadata de
+        PyArrow (decimal_factor, symbol, timeframe, source). La estrategia
+        corregida:
+          1. Leer la metadata del archivo original con pq.read_schema().
+          2. Hacer el sort+dedup con Polars (eficiencia en memoria).
+          3. Convertir el resultado a pa.Table y reinyectar la metadata.
+          4. Escribir con pq.write_table (que sí preserva metadata) + rename.
         """
         if timeframe in _NOFINALIZE_TIMEFRAMES:
             return
@@ -197,19 +207,38 @@ class ParquetWriter:
             return
 
         with self._global_write_lock:
+            tmp = path.with_name(f"{path.stem}_{uuid.uuid4().hex}.tmp.parquet")
             try:
-                tmp = path.with_name(f"{path.stem}_{uuid.uuid4().hex}.tmp.parquet")
-                (
+                # 1. Recuperar metadata del archivo original ANTES de modificarlo
+                original_schema = pq.read_schema(path)
+                original_meta   = original_schema.metadata or {}
+
+                # 2. Sort + dedup con Polars (lazy, eficiente en RAM)
+                result_df = (
                     pl.scan_parquet(path)
                     .unique(subset=["timestamp"], keep="last")
                     .sort("timestamp")
-                    .sink_parquet(
-                        tmp,
-                        compression=_COMPRESSION,
-                        compression_level=_COMPRESSION_LEVEL,
-                    )
+                    .collect()
+                    .to_pandas()
+                )
+
+                # 3. Determinar el schema pyarrow correcto y reinyectar metadata
+                is_tick          = timeframe == "tick"
+                base_schema      = _TICK_SCHEMA if is_tick else _OHLCV_SCHEMA
+                schema_with_meta = base_schema.with_metadata(original_meta)
+                table            = pa.Table.from_pandas(
+                    result_df, schema=schema_with_meta, preserve_index=False
+                )
+
+                # 4. Escritura atómica con PyArrow (preserva metadata en footer)
+                pq.write_table(
+                    table,
+                    tmp,
+                    compression=_COMPRESSION,
+                    compression_level=_COMPRESSION_LEVEL,
                 )
                 tmp.replace(path)
+
             except Exception as exc:
                 log.error("Error finalizando %s: %s", path, exc)
                 if tmp.exists():

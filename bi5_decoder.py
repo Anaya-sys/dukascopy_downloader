@@ -65,7 +65,11 @@ _OHLCV_DTYPE = np.dtype([
 ])
 
 # Column name lists (public for tests)
-TICK_COLS  = ["timestamp", "ask", "bid", "ask_volume", "bid_volume"]
+# BUG #1 FIX: usar "ask_vol"/"bid_vol" — nombre canónico que coincide con
+# _TICK_DTYPE, _TICK_SCHEMA de parquet_writer y los campos del binario .bi5.
+# El nombre anterior "ask_volume"/"bid_volume" provocaba ArrowInvalid en
+# pa.Table.from_pandas() al intentar escribir ticks en modo raw_prices=True.
+TICK_COLS  = ["timestamp", "ask", "bid", "ask_vol", "bid_vol"]
 OHLCV_COLS = ["timestamp", "open", "high", "low", "close", "volume"]
 
 
@@ -97,6 +101,8 @@ class Bi5Decoder:
                            * timestamp column as ISO-8601 string with "+00:00" suffix.
                          True — raw output for the Parquet writer:
                            * price columns as int32, NOT divided by decimal_factor.
+                             decimal_factor is intentionally ignored in this mode;
+                             ParquetWriter stores it as file-level Parquet metadata.
                            * timestamp column as int64 milliseconds since Unix epoch UTC.
                            * volume columns always float32 (unchanged in both modes).
 
@@ -171,8 +177,8 @@ class Bi5Decoder:
                 "timestamp":  ts_strs,
                 "ask":        arr["ask"].astype(np.float32) / decimal_factor,
                 "bid":        arr["bid"].astype(np.float32) / decimal_factor,
-                "ask_volume": arr["ask_vol"].astype(np.float32),
-                "bid_volume": arr["bid_vol"].astype(np.float32),
+                "ask_vol":    arr["ask_vol"].astype(np.float32),
+                "bid_vol":    arr["bid_vol"].astype(np.float32),
             })
         else:
             # OHLCV: ms_offset is treated as seconds (existing convention; see module docstring).
@@ -202,6 +208,10 @@ class Bi5Decoder:
         Timestamps → int64, milliseconds since Unix epoch UTC.
         Volumes → float32, same as float mode.
 
+        Note: ``decimal_factor`` is intentionally NOT received here because
+        in raw mode prices are returned unscaled. The caller (ParquetWriter)
+        stores decimal_factor as file-level Parquet metadata instead.
+
         Timestamp derivation mirrors _build_float to guarantee parity:
           Tick    : ts_ms = base_epoch_ms + ms_offset          (ms_offset already in ms)
           OHLCV   : ts_ms = base_epoch_ms + ms_offset * 1000   (ms_offset treated as seconds)
@@ -212,11 +222,11 @@ class Bi5Decoder:
         if is_tick:
             ts_ms = (base_epoch_ms + offsets_i64).astype(np.int64)
             return pd.DataFrame({
-                "timestamp":  ts_ms,
-                "ask":        arr["ask"].astype(np.int32),
-                "bid":        arr["bid"].astype(np.int32),
-                "ask_volume": arr["ask_vol"].astype(np.float32),
-                "bid_volume": arr["bid_vol"].astype(np.float32),
+                "timestamp": ts_ms,
+                "ask":       arr["ask"].astype(np.int32),
+                "bid":       arr["bid"].astype(np.int32),
+                "ask_vol":   arr["ask_vol"].astype(np.float32),   # BUG #1 FIX: ask_vol (no ask_volume)
+                "bid_vol":   arr["bid_vol"].astype(np.float32),   # BUG #1 FIX: bid_vol (no bid_volume)
             })
         else:
             # Multiply by 1000 to convert seconds → milliseconds (mirrors timedelta64[s] path)

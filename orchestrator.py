@@ -92,8 +92,13 @@ def _resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     ).dropna(subset=["open"]).reset_index()
 
     if raw_int:
-        # Devolver int64 ms-epoch (el ParquetWriter espera este tipo)
-        rs["timestamp"] = rs["timestamp"].astype("int64") // 1_000_000
+        # BUG #3 FIX: pandas 3 usa resolución 'us' (microsegundos); pandas 2 usa 'ns' (nanosegundos).
+        # astype("int64") devuelve el valor en la unidad nativa del dtype, no siempre nanosegundos.
+        # Detectamos la unidad antes de dividir para producir siempre milisegundos.
+        ts_col = rs["timestamp"]
+        unit   = getattr(ts_col.dtype, "unit", "ns")      # "us" en pandas 3, "ns" en pandas 2
+        divisor = {"us": 1_000, "ns": 1_000_000, "ms": 1}.get(unit, 1_000_000)
+        rs["timestamp"] = ts_col.astype("int64") // divisor
     else:
         # Devolver string ISO (el CsvWriter espera este tipo)
         rs["timestamp"] = (

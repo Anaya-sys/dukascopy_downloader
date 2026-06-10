@@ -1,6 +1,10 @@
 """
 csv_writer.py
 
+# DEPRECATED: usar parquet_writer.py. Mantenido durante transición hasta
+# eliminación en Fase futura. Instanciado solo cuando STORAGE_FORMAT="csv".
+# Ver PRD §Fase 2D y migrate_csv_to_parquet.py para migrar datos históricos.
+
 Escribe (o hace append) pandas DataFrames a archivos CSV de forma thread-safe.
 
 Convención de rutas:
@@ -16,7 +20,6 @@ from __future__ import annotations
 import logging
 import threading
 from pathlib import Path
-import gc
 import pandas as pd
 import polars as pl
 
