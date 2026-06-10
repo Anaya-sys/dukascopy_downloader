@@ -26,6 +26,17 @@ TIMEFRAMES: list[str] = ["tick", "m15", "h1", "h4"]
 # Nombres amigables para mostrar al usuario (coinciden con los alias del CLI)
 TIMEFRAMES_DISPLAY: list[str] = ["tick", "m15", "1h", "4h"]
 
+# ── Almacenamiento — Fase 2C ─────────────────────────────────────────────
+# STORAGE_FORMAT controla qué writer instancia el orchestrator.
+# Valores válidos: "parquet" | "csv".
+# Sobreescribible en runtime vía --format en el CLI.
+STORAGE_FORMAT: str = "parquet"
+
+# Compresión Parquet (usado por ParquetWriter).  ZSTD nivel 1 maximiza
+# la velocidad de escritura en streaming de tick data.
+PARQUET_COMPRESSION: str = "zstd"
+PARQUET_COMPRESSION_LEVEL: int = 1
+
 # ── HTTP client (httpx) — Fase 1 ─────────────────────────────────────────
 # HTTPX_MAX_CONNECTIONS debe coincidir o superar MAX_WORKERS para que cada
 # worker pueda tener su propia conexión TCP persistente sin contención.

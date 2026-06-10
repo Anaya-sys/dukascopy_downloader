@@ -33,9 +33,11 @@ from tqdm import tqdm
 from bi5_decoder import Bi5Decoder
 from checkpoint_manager import CheckpointManager
 from csv_writer import CsvWriter
+from parquet_writer import ParquetWriter
 from dukascopy_client import ChunkDownloadError, DukascopyClient
 from failure_logger import FailureLogger
 from github_scraper import GitHubScraper, Instrument
+import config as _cfg
 import gc
 
 log = logging.getLogger(__name__)
@@ -59,18 +61,45 @@ def _resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
 
     ``closed='left'`` y ``label='left'`` garantizan que cada bucket se
     etiquete con su tiempo de *apertura*, evitando look-ahead bias.
+
+    Soporta dos formatos de timestamp en el DataFrame de entrada:
+
+      int64 ms-epoch (raw_prices=True, path Parquet)
+        pd.to_datetime(..., unit="ms", utc=True) produce DatetimeTZDtype(UTC).
+        El resultado se devuelve como int64 ms-epoch para que ParquetWriter
+        reciba el mismo tipo que produce Bi5Decoder en modo raw.
+
+      string ISO "+00:00" (raw_prices=False, path CSV)
+        pd.to_datetime(...) parsea la tz del string; el resultado se serializa
+        de vuelta a string con el mismo formato que el decoder produce.
     """
     if df.empty:
         return df
+
     df2 = df.copy()
-    df2["timestamp"] = pd.to_datetime(df2["timestamp"])
+    raw_int = pd.api.types.is_integer_dtype(df2["timestamp"])
+
+    if raw_int:
+        # int64 ms-epoch → DatetimeIndex UTC-aware
+        df2["timestamp"] = pd.to_datetime(df2["timestamp"], unit="ms", utc=True)
+    else:
+        # ISO string con "+00:00" → DatetimeIndex UTC-aware
+        df2["timestamp"] = pd.to_datetime(df2["timestamp"], utc=True)
+
     df2 = df2.set_index("timestamp").sort_index()
     rs = df2.resample(rule, closed="left", label="left").agg(
         {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
-    ).dropna(subset=["open"])
+    ).dropna(subset=["open"]).reset_index()
 
-    rs = rs.dropna(subset=["open"]).reset_index()
-    rs["timestamp"] = rs["timestamp"].dt.tz_convert(None).dt.strftime("%Y-%m-%d %H:%M:%S+00:00")
+    if raw_int:
+        # Devolver int64 ms-epoch (el ParquetWriter espera este tipo)
+        rs["timestamp"] = rs["timestamp"].astype("int64") // 1_000_000
+    else:
+        # Devolver string ISO (el CsvWriter espera este tipo)
+        rs["timestamp"] = (
+            rs["timestamp"].dt.tz_convert("UTC").dt.strftime("%Y-%m-%d %H:%M:%S+00:00")
+        )
+
     return rs[["timestamp", "open", "high", "low", "close", "volume"]]
 
 
@@ -127,14 +156,25 @@ class DownloadOrchestrator:
         self._workers     = max_workers
         self._client      = DukascopyClient(max_retries=max_retries)
         self._decoder     = Bi5Decoder()
-        self._csv         = CsvWriter(self._output)
         self._checkpoint  = CheckpointManager(self._output)
         self._failures    = FailureLogger(self._output)
         self._scraper     = GitHubScraper()
         self._decode_sem = threading.BoundedSemaphore(3)
         self._checkpoint_buf: list[tuple] = []
-        self._checkpoint_buf_lock = threading.RLock()  # RLock: permite re-entrada desde _flush_checkpoints (Bug C)
+        self._checkpoint_buf_lock = threading.RLock()
         self._CHECKPOINT_BATCH = 15
+
+        # ── Writer condicional — Fase 2C ──────────────────────────────────
+        storage_fmt = _cfg.STORAGE_FORMAT
+        if storage_fmt == "parquet":
+            self._writer = ParquetWriter(self._output)
+            self._raw_prices = True
+            log.info("Formato de almacenamiento activo: Parquet (ZSTD nivel %d)",
+                     _cfg.PARQUET_COMPRESSION_LEVEL)
+        else:
+            self._writer = CsvWriter(self._output)
+            self._raw_prices = False
+            log.info("Formato de almacenamiento activo: CSV")
 
     # ── Task builder ──────────────────────────────────────────────────────
 
@@ -226,11 +266,12 @@ class DownloadOrchestrator:
                 continue
                 
             with self._decode_sem:
-                 df = self._decoder.decode(raw, "tick", factor, hour_dt)
+                 df = self._decoder.decode(raw, "tick", factor, hour_dt,
+                                           raw_prices=self._raw_prices)
                  del raw
             if not df.empty:
                 df.sort_values("timestamp", inplace=True)
-                self._csv.write(symbol, "tick", df)
+                self._writer.write(symbol, "tick", df, decimal_factor=factor)
                 del df
 
     def _execute_ohlcv_day(self, symbol: str, tf: str, dt: date, factor: int) -> None:
@@ -243,14 +284,15 @@ class DownloadOrchestrator:
             return
         
         with self._decode_sem:   # ← max 3 decodificaciones simultáneas
-             df = self._decoder.decode(raw, download_tf, factor, base_dt)
+             df = self._decoder.decode(raw, download_tf, factor, base_dt,
+                                       raw_prices=self._raw_prices)
              del raw
              if df.empty:
                 return
         rule = _RESAMPLE_RULE.get(tf)
         if rule:
             df = _resample_ohlcv(df, rule)
-        self._csv.write(symbol, tf, df)
+        self._writer.write(symbol, tf, df, decimal_factor=factor)
         del df
 
     def _execute_ohlcv_month(self, symbol: str, tf: str, dt: date, factor: int) -> None:
@@ -262,7 +304,8 @@ class DownloadOrchestrator:
         raw = self._client.download_chunk(symbol, download_tf, dt)
         if raw is None:
             return
-        df = self._decoder.decode(raw, download_tf, factor, base_dt)
+        df = self._decoder.decode(raw, download_tf, factor, base_dt,
+                                  raw_prices=self._raw_prices)
         del raw  # Bug E fix: liberar bytes comprimidos en TODOS los paths, incluso df vacío
         if df.empty:
             return
@@ -273,7 +316,7 @@ class DownloadOrchestrator:
         else:
             df.sort_values("timestamp", inplace=True)
 
-        self._csv.write(symbol, tf, df)
+        self._writer.write(symbol, tf, df, decimal_factor=factor)
         del df
         gc.collect()
 
@@ -322,10 +365,13 @@ class DownloadOrchestrator:
         if ohlcv_targets:
             print("Consolidando, ordenando y limpiando archivos OHLCV (Post-Deduplicación)...")
             for sym, tf in tqdm(ohlcv_targets, unit="file", dynamic_ncols=True):
-                self._csv.finalize(sym, tf)
+                self._writer.finalize(sym, tf)
             print("Archivos OHLCV consolidados perfectamente.")
 
         fail_path = self._output / "failed.log"
         if fail_path.exists() and fail_path.stat().st_size > 0:
             print(f"  ⚠  Algunos chunks fallaron. Revisa: {fail_path}")
-            self._flush_checkpoints(force=True)
+
+        # Vaciar siempre el buffer de checkpoints al terminar el run,
+        # independientemente de si hubo fallos o no.
+        self._flush_checkpoints(force=True)

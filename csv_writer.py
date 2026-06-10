@@ -48,7 +48,8 @@ class CsvWriter:
             
         return self._base / symbol / folder / filename
 
-    def write(self, symbol: str, timeframe: str, df: pd.DataFrame) -> None:
+    def write(self, symbol: str, timeframe: str, df: pd.DataFrame,
+              decimal_factor: int = 1) -> None:
         """Escribe el DataFrame en disco usando Append-Only ultrarrápido para todos."""
         if df.empty:
             return

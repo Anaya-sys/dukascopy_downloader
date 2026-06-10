@@ -104,6 +104,16 @@ def main() -> None:
             f"(default: {' '.join(config.TIMEFRAMES_DISPLAY)})"
         ),
     )
+    parser.add_argument(
+        "--format", "-f",
+        choices=["parquet", "csv"],
+        default=None,
+        metavar="FORMAT",
+        help=(
+            "Formato de almacenamiento de salida: parquet | csv "
+            f"(default: {config.STORAGE_FORMAT})"
+        ),
+    )
     args = parser.parse_args()
 
     # ── Resolver ruta de salida ───────────────────────────────────────────
@@ -116,6 +126,13 @@ def main() -> None:
     raw_tfs = args.timeframes if args.timeframes else config.TIMEFRAMES_DISPLAY
     timeframes = _parse_timeframes(raw_tfs)
 
+    # ── Resolver formato de almacenamiento ────────────────────────────────
+    # --format sobreescribe config.STORAGE_FORMAT en runtime.
+    # La asignación ocurre antes de importar orchestrator para que
+    # DownloadOrchestrator lea el valor ya actualizado de config.
+    if args.format is not None:
+        config.STORAGE_FORMAT = args.format
+
     # ── Crear directorio de salida si no existe ───────────────────────────
     if output_path.exists():
         print(f"Directorio de salida: {output_path}  (ya existe)")
@@ -125,6 +142,7 @@ def main() -> None:
 
     print(f"Workers    : {workers}")
     print(f"Timeframes : {', '.join(raw_tfs)}")
+    print(f"Formato    : {config.STORAGE_FORMAT}")
     print()
 
     # ── Ejecutar ──────────────────────────────────────────────────────────
