@@ -79,6 +79,23 @@ def _detect_backend() -> str:
     )
 
 
+def _module_available(name: str) -> bool:
+    """True si un módulo puede importarse sin importarlo realmente."""
+    import importlib.util
+    return importlib.util.find_spec(name) is not None
+
+
+# El path de migración en streaming (memoria acotada) requiere Polars para el
+# parseo/transformación lazy + sink_parquet, y PyArrow para reinyectar la
+# file-level metadata escribiendo por row-group. Si falta alguno, se usa el
+# path clásico basado en pandas (carga el archivo completo en memoria).
+_STREAMING_AVAILABLE = _module_available("polars") and _module_available("pyarrow")
+
+# Tamaño de row-group / batch para escritura y finalización en streaming.
+# Acota el working set de memoria durante la copia con metadata.
+_ROW_GROUP_SIZE = 256_000
+
+
 # ── Timeframe mapping ─────────────────────────────────────────────────────
 
 # Detecta el timeframe a partir de la carpeta en la convención de rutas:
@@ -300,7 +317,9 @@ def _write_parquet_polars(
             b"migrated_from":  b"csv",
             b"migration_ts":   datetime.now(tz=timezone.utc).isoformat().encode(),
         }
-        table = table.replace_schema_metadata({**table.schema.metadata, **file_meta})
+        # table.schema.metadata puede ser None si el Parquet no traía metadata;
+        # `or {}` evita "'NoneType' object is not a mapping".
+        table = table.replace_schema_metadata({**(table.schema.metadata or {}), **file_meta})
         meta_tmp = path.with_name(f"{path.stem}_{uuid.uuid4().hex}.meta.parquet")
         try:
             pq.write_table(table, meta_tmp, compression="zstd", compression_level=1)
@@ -317,6 +336,169 @@ def _write_parquet_polars(
         if tmp.exists():
             tmp.unlink(missing_ok=True)
         raise
+
+
+# ── Streaming migration (memoria acotada) ─────────────────────────────────
+
+def _price_and_vol_cols(timeframe: str) -> tuple[list[str], list[str]]:
+    """Retorna (price_cols, vol_cols) según el timeframe."""
+    if timeframe == "tick":
+        return ["ask", "bid"], ["ask_vol", "bid_vol"]
+    return ["open", "high", "low", "close"], ["volume"]
+
+
+def _build_lazy_plan(csv_path: Path, timeframe: str, factor: int):
+    """
+    Construye un LazyFrame de Polars con todas las transformaciones:
+      - timestamp str/int → int64 ms-epoch UTC
+      - precios float → int32 escalado (o cast si ya son int)
+      - volúmenes → float32
+      - orden por timestamp
+
+    No materializa datos: el sink_parquet posterior ejecuta el plan en
+    streaming con memoria acotada.
+    """
+    import polars as pl
+
+    lf = pl.scan_csv(csv_path)
+    schema = lf.collect_schema()
+    names = set(schema.names())
+
+    # timestamp: pass-through si ya es entero (ms-epoch), si no parsear ISO→ms
+    if schema["timestamp"].is_integer():
+        ts_expr = pl.col("timestamp").cast(pl.Int64)
+    else:
+        ts_expr = (
+            pl.col("timestamp")
+            .str.to_datetime(time_zone="UTC")
+            .dt.epoch(time_unit="ms")
+            .cast(pl.Int64)
+        )
+
+    price_cols, vol_cols = _price_and_vol_cols(timeframe)
+
+    exprs = [ts_expr.alias("timestamp")]
+    for col in price_cols:
+        if col not in names:
+            continue
+        if schema[col].is_integer():
+            exprs.append(pl.col(col).cast(pl.Int32))
+        else:
+            exprs.append((pl.col(col) * factor).round(0).cast(pl.Int32).alias(col))
+    for col in vol_cols:
+        if col in names:
+            exprs.append(pl.col(col).cast(pl.Float32))
+
+    lf = lf.with_columns(exprs)
+
+    final_cols = (
+        ["timestamp"]
+        + [c for c in price_cols if c in names]
+        + [c for c in vol_cols if c in names]
+    )
+    return lf.select(final_cols).sort("timestamp")
+
+
+def _finalize_with_metadata(
+    tmp: Path,
+    final: Path,
+    symbol: str,
+    timeframe: str,
+    factor: int,
+) -> None:
+    """
+    Reinyecta la file-level metadata al Parquet escrito por sink_parquet.
+
+    Polars sink_parquet no expone metadata custom, así que se reescribe el
+    archivo con PyArrow añadiendo la metadata. Para mantener la memoria
+    acotada se copia row-group por row-group (NO se carga la tabla entera).
+    Sobreescritura atómica vía archivo .meta temporal + rename.
+    """
+    import pyarrow.parquet as pq
+
+    pf = pq.ParquetFile(tmp)
+    file_meta = {
+        b"decimal_factor": str(factor).encode(),
+        b"symbol":         symbol.upper().encode(),
+        b"timeframe":      timeframe.encode(),
+        b"source":         b"dukascopy",
+        b"migrated_from":  b"csv",
+        b"migration_ts":   datetime.now(tz=timezone.utc).isoformat().encode(),
+    }
+    existing = pf.schema_arrow.metadata or {}
+    schema_with_meta = pf.schema_arrow.with_metadata({**existing, **file_meta})
+
+    meta_tmp = final.with_name(f"{final.stem}_{uuid.uuid4().hex}.meta.parquet")
+    writer = pq.ParquetWriter(
+        meta_tmp, schema_with_meta, compression="zstd", compression_level=1
+    )
+    try:
+        # iter_batches mantiene la memoria acotada (no carga el archivo entero)
+        for batch in pf.iter_batches(batch_size=_ROW_GROUP_SIZE):
+            writer.write_batch(batch)
+        writer.close()
+        meta_tmp.replace(final)
+    except Exception:
+        writer.close()
+        if meta_tmp.exists():
+            meta_tmp.unlink(missing_ok=True)
+        raise
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+
+
+def _migrate_file_streaming(
+    csv_path: Path,
+    timeframe: str,
+    symbol: str,
+    factor: int,
+    parquet_path: Path,
+    dry_run: bool,
+    result: dict,
+) -> dict:
+    """Migración con memoria acotada (Polars sink + PyArrow row-group copy)."""
+    import polars as pl
+
+    rows_in = pl.scan_csv(csv_path).select(pl.len()).collect().item()
+    result["rows_in"] = rows_in
+
+    if rows_in == 0:
+        result["status"] = "skipped_empty"
+        return result
+
+    lf = _build_lazy_plan(csv_path, timeframe, factor)
+
+    if dry_run:
+        result["status"]   = "dry_run_ok"
+        result["rows_out"] = rows_in
+        return result
+
+    parquet_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = parquet_path.with_name(f"{parquet_path.stem}_{uuid.uuid4().hex}.tmp.parquet")
+    try:
+        lf.sink_parquet(
+            tmp, compression="zstd", compression_level=1,
+            row_group_size=_ROW_GROUP_SIZE,
+        )
+        _finalize_with_metadata(tmp, parquet_path, symbol, timeframe, factor)
+    except Exception:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+        raise
+
+    rows_out = pl.scan_parquet(parquet_path).select(pl.len()).collect().item()
+    result["rows_out"] = rows_out
+
+    if rows_out != rows_in:
+        parquet_path.unlink(missing_ok=True)
+        raise ValueError(
+            f"Discrepancia de filas: CSV={rows_in} vs Parquet={rows_out}. "
+            "Archivo Parquet eliminado para evitar corrupción."
+        )
+
+    result["status"] = "ok"
+    return result
 
 
 # ── Core migration logic ──────────────────────────────────────────────────
@@ -351,6 +533,19 @@ def migrate_file(
     }
 
     try:
+        # Path preferido: streaming con memoria acotada (Polars + PyArrow).
+        if _STREAMING_AVAILABLE:
+            return _migrate_file_streaming(
+                csv_path=csv_path,
+                timeframe=timeframe,
+                symbol=symbol,
+                factor=factor,
+                parquet_path=parquet_path,
+                dry_run=dry_run,
+                result=result,
+            )
+
+        # ── Fallback pandas (carga el archivo completo en memoria) ──────────
         # 1. Leer CSV
         df = pd.read_csv(csv_path, low_memory=False)
         rows_in = len(df)
