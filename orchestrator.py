@@ -363,15 +363,15 @@ class DownloadOrchestrator:
 
         print("\nDescarga completada.")
 
-        ohlcv_targets = {
-            (t.symbol, t.timeframe) for t in tasks if t.timeframe != "tick"
-        }
-        
-        if ohlcv_targets:
-            print("Consolidando, ordenando y limpiando archivos OHLCV (Post-Deduplicación)...")
-            for sym, tf in tqdm(ohlcv_targets, unit="file", dynamic_ncols=True):
+        # Un archivo por chunk → finalize() fusiona TODOS los timeframes
+        # (incluido tick: agrupa sus chunks horarios en parquets mensuales).
+        finalize_targets = {(t.symbol, t.timeframe) for t in tasks}
+
+        if finalize_targets:
+            print("Consolidando, ordenando y limpiando archivos (merge de chunks)...")
+            for sym, tf in tqdm(finalize_targets, unit="file", dynamic_ncols=True):
                 self._writer.finalize(sym, tf)
-            print("Archivos OHLCV consolidados perfectamente.")
+            print("Archivos consolidados perfectamente.")
 
         fail_path = self._output / "failed.log"
         if fail_path.exists() and fail_path.stat().st_size > 0:
