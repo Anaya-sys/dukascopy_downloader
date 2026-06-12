@@ -165,8 +165,14 @@ class DownloadOrchestrator:
         self._failures    = FailureLogger(self._output)
         self._scraper     = GitHubScraper()
         self._decode_sem = threading.BoundedSemaphore(3)
-        self._checkpoint_buf: list[tuple] = []
-        self._checkpoint_buf_lock = threading.RLock()
+        # FIX GAP BUG: reemplaza el buffer de lista por dos sets explícitos.
+        # _succeeded: días que terminaron bien (symbol, tf, date).
+        # _failed_days: días que fallaron con ChunkDownloadError (symbol, tf, date).
+        # _flush_checkpoints avanza el checkpoint sólo hasta el mayor día
+        # consecutivo sin huecos — no salta sobre ningún gap.
+        self._succeeded: set[tuple] = set()
+        self._failed_days: set[tuple] = set()
+        self._checkpoint_lock = threading.RLock()
         self._CHECKPOINT_BATCH = 15
 
         # ── Writer condicional — Fase 2C ──────────────────────────────────
@@ -210,14 +216,55 @@ class DownloadOrchestrator:
         return tasks
     
     def _flush_checkpoints(self, force=False):
-       with self._checkpoint_buf_lock:
-            if not self._checkpoint_buf:
-               return
-            if not force and len(self._checkpoint_buf) < self._CHECKPOINT_BATCH:
-               return
-            for sym, tf, d in self._checkpoint_buf:
-               self._checkpoint.update(sym, tf, d)
-            self._checkpoint_buf.clear()  # Bug B fix: fuera del for; se ejecuta tras persistir TODOS los items
+        with self._checkpoint_lock:
+            total = len(self._succeeded) + len(self._failed_days)
+            if total == 0:
+                return
+            if not force and total < self._CHECKPOINT_BATCH:
+                return
+
+            # Agrupar días exitosos por (symbol, tf)
+            from collections import defaultdict
+            by_key: dict[tuple, list[date]] = defaultdict(list)
+            for sym, tf, d in self._succeeded:
+                by_key[(sym, tf)].append(d)
+
+            # Días fallidos de esta sesión, indexados por (sym, tf) para lookup rápido
+            failed_by_key: dict[tuple, set[date]] = defaultdict(set)
+            for sym, tf, d in self._failed_days:
+                failed_by_key[(sym, tf)].add(d)
+
+            for (sym, tf), days in by_key.items():
+                days.sort()
+                # Punto de partida: el checkpoint ya persistido en disco
+                current = self._checkpoint.get_last_date(sym, tf)
+                failed_here = failed_by_key.get((sym, tf), set())
+
+                # Avanzar sólo mientras los días sean estrictamente consecutivos
+                # y no hayan fallado. Un hueco o un día fallido detiene el avance.
+                for d in days:
+                    if current is None:
+                        # Sin checkpoint previo: el primer día exitoso sólo vale
+                        # si no hay ningún día fallido anterior a él en esta sesión.
+                        if any(f < d for f in failed_here):
+                            break
+                        # Primer día válido: lo tomamos como inicio.
+                    else:
+                        expected = current + timedelta(days=1)
+                        if d != expected:
+                            # Hay un hueco entre current y d
+                            break
+                    if (sym, tf, d) in self._failed_days:
+                        # Día registrado como fallo: detener
+                        break
+                    current = d
+
+                if current and (not self._checkpoint.get_last_date(sym, tf) or
+                                current > self._checkpoint.get_last_date(sym, tf)):
+                    self._checkpoint.update(sym, tf, current)
+
+            self._succeeded.clear()
+            self._failed_days.clear()
     # ── Single task executor ──────────────────────────────────────────────
 
     def _execute_task(self, task: Task) -> None:
@@ -251,11 +298,13 @@ class DownloadOrchestrator:
                 # la próxima ejecución para obtener las velas más recientes
             else:
                 if dt < date.today():
-                   with self._checkpoint_buf_lock:
-                      self._checkpoint_buf.append((symbol, tf, dt))  # Bug A fix: dt, no last_of_month
+                   with self._checkpoint_lock:
+                      self._succeeded.add((symbol, tf, dt))
                       self._flush_checkpoints()
 
         except ChunkDownloadError as exc:
+            with self._checkpoint_lock:
+                self._failed_days.add((symbol, tf, dt))
             self._failures.log(symbol, tf, dt, str(exc))
         except Exception as exc:
             log.error("Error inesperado %s/%s/%s: %s", symbol, tf, dt, exc, exc_info=True)
@@ -346,37 +395,57 @@ class DownloadOrchestrator:
 
         print(f"Iniciando descarga con {self._workers} workers…\n")
 
-        with ThreadPoolExecutor(max_workers=self._workers) as pool:
-            futures = {pool.submit(self._execute_task, t): t for t in tasks}
-            with tqdm(total=len(tasks), unit="task", dynamic_ncols=True) as pbar:
-                for fut in as_completed(futures):
-                    task = futures[fut]
-                    try:
-                        fut.result()
-                    except Exception as exc:
-                        log.error(
-                            "Task %s/%s/%s lanzó: %s",
-                            task.symbol, task.timeframe, task.dt, exc,
-                        )
-                    pbar.set_postfix_str(f"{task.symbol}/{task.timeframe}", refresh=False)
-                    pbar.update(1)
+        # ── FIX BUG CHECKPOINT-1: garantizar flush aunque haya Ctrl+C ────────
+        # _flush_checkpoints(force=True) estaba sólo después del with-block.
+        # Un KeyboardInterrupt salía del with-block sin ejecutarlo, perdiendo
+        # hasta _CHECKPOINT_BATCH-1 (=14) checkpoints del buffer en memoria.
+        # El finally garantiza que se ejecute SIEMPRE: en completado normal,
+        # en Ctrl+C y en cualquier otra excepción inesperada.
+        # finalize() también se llama en el finally para que los chunks
+        # parciales se mergeen incluso si la descarga fue interrumpida.
+        interrupted = False
+        try:
+            with ThreadPoolExecutor(max_workers=self._workers) as pool:
+                futures = {pool.submit(self._execute_task, t): t for t in tasks}
+                with tqdm(total=len(tasks), unit="task", dynamic_ncols=True) as pbar:
+                    for fut in as_completed(futures):
+                        task = futures[fut]
+                        try:
+                            fut.result()
+                        except Exception as exc:
+                            log.error(
+                                "Task %s/%s/%s lanzó: %s",
+                                task.symbol, task.timeframe, task.dt, exc,
+                            )
+                        pbar.set_postfix_str(f"{task.symbol}/{task.timeframe}", refresh=False)
+                        pbar.update(1)
+        except KeyboardInterrupt:
+            interrupted = True
+            print("\n⚠  Descarga interrumpida por el usuario. Guardando progreso…")
+        finally:
+            # Garantizado: se ejecuta en completado normal, Ctrl+C y error.
+            self._flush_checkpoints(force=True)
 
-        print("\nDescarga completada.")
+        if not interrupted:
+            print("\nDescarga completada.")
 
         # Un archivo por chunk → finalize() fusiona TODOS los timeframes
         # (incluido tick: agrupa sus chunks horarios en parquets mensuales).
+        # Se ejecuta también en interrupción: conserva los chunks ya escritos.
         finalize_targets = {(t.symbol, t.timeframe) for t in tasks}
 
         if finalize_targets:
             print("Consolidando, ordenando y limpiando archivos (merge de chunks)...")
             for sym, tf in tqdm(finalize_targets, unit="file", dynamic_ncols=True):
-                self._writer.finalize(sym, tf)
+                try:
+                    self._writer.finalize(sym, tf)
+                except Exception as exc:
+                    log.error("Error consolidando %s/%s: %s", sym, tf, exc)
             print("Archivos consolidados perfectamente.")
 
         fail_path = self._output / "failed.log"
         if fail_path.exists() and fail_path.stat().st_size > 0:
             print(f"  ⚠  Algunos chunks fallaron. Revisa: {fail_path}")
 
-        # Vaciar siempre el buffer de checkpoints al terminar el run,
-        # independientemente de si hubo fallos o no.
-        self._flush_checkpoints(force=True)
+        if interrupted:
+            print("  💡 Checkpoint guardado. Ejecuta de nuevo para continuar desde donde se dejó.")

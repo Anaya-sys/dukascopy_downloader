@@ -71,9 +71,11 @@ class DukascopyClient:
         base_backoff: float = 1.0,
         timeout: int = 30,  # retenido para compatibilidad con llamadas existentes;
                             # los timeouts reales se leen desde config.HTTPX_*_TIMEOUT
+        max_404_retries: int = _cfg.MAX_404_RETRIES,
     ) -> None:
-        self._max_retries  = max_retries
-        self._base_backoff = base_backoff
+        self._max_retries     = max_retries
+        self._base_backoff    = base_backoff
+        self._max_404_retries = max_404_retries
 
         # httpx.Timeout(default, connect=override): el primer argumento establece
         # el default para read/write/pool; connect se sobreescribe con el valor
@@ -83,8 +85,11 @@ class DukascopyClient:
             connect=_cfg.HTTPX_CONNECT_TIMEOUT,
         )
 
+        # CONCLUSIÓN EXPERIMENTAL (Teoría 1): HTTP/2 negociado con Dukascopy
+        # provoca httpx.ReadError bajo multiplexación.  http2 se controla vía
+        # config.HTTP2_ENABLED (False por defecto → HTTP/1.1 keep-alive).
         self._client = httpx.Client(
-            http2=True,
+            http2=_cfg.HTTP2_ENABLED,
             limits=httpx.Limits(
                 max_connections=_cfg.HTTPX_MAX_CONNECTIONS,
                 max_keepalive_connections=_cfg.HTTPX_MAX_KEEPALIVE_CONNECTIONS,
@@ -161,6 +166,7 @@ class DukascopyClient:
         """
         url = self._build_url(symbol, timeframe, dt)
         last_exc: Exception | None = None
+        seen_404 = 0
 
         for attempt in range(self._max_retries):
             try:
@@ -175,7 +181,21 @@ class DukascopyClient:
                 )
 
                 if resp.status_code == 404:
-                    return None
+                    # FIX Teoría 2: un 404 puede ser un fallo transitorio del
+                    # servidor, no ausencia real de datos.  Reintentamos antes
+                    # de aceptarlo.  Solo un 404 PERSISTENTE se interpreta como
+                    # "no hay datos" (None).  Un 404 intermitente que luego
+                    # devuelve 200 deja de producir huecos silenciosos.
+                    seen_404 += 1
+                    if seen_404 > self._max_404_retries:
+                        return None
+                    wait = self._base_backoff * (2 ** attempt) + random.uniform(0, 0.5)
+                    log.warning(
+                        "404 (%d/%d) para %s %s %s. Reverificando en %.1fs…",
+                        seen_404, self._max_404_retries, symbol, timeframe, dt, wait,
+                    )
+                    time.sleep(wait)
+                    continue
 
                 resp.raise_for_status()
                 return resp.content
@@ -193,6 +213,11 @@ class DukascopyClient:
                     attempt + 1, self._max_retries, symbol, timeframe, dt, exc, wait,
                 )
                 time.sleep(wait)
+
+        # Si el loop se agotó habiendo visto SOLO 404s (sin error de red),
+        # se interpreta como ausencia real de datos.
+        if last_exc is None and seen_404 > 0:
+            return None
 
         raise ChunkDownloadError(
             f"Falló la descarga de {symbol}/{timeframe}/{dt} tras "

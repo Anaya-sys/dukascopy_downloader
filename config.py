@@ -14,10 +14,21 @@ BASE_PATH: pathlib.Path = (
 )
 
 # ── Paralelismo ───────────────────────────────────────────────────────────
-MAX_WORKERS: int = 8   # máx 16
+# CONCLUSIÓN EXPERIMENTAL (Teoría 1): el throughput está limitado por el
+# servidor (throttle por IP), no por el cliente.  8 workers no superan a 4 en
+# wall-time (~4.8s para 24 chunks en ambos casos).  Se fija en 4 para reducir
+# presión sobre el servidor y la probabilidad de reset de conexión, sin perder
+# velocidad.  El solapamiento de red+decode aún justifica >1 worker.
+MAX_WORKERS: int = 4
 
 # ── Política de reintentos ────────────────────────────────────────────────
 MAX_RETRIES: int = 3
+
+# Reintentos específicos para HTTP 404 (Teoría 2): un 404 puede ser un fallo
+# transitorio del servidor, no una ausencia real de datos.  Antes de aceptar
+# un 404 como "no hay datos" se reintenta este número de veces.  Solo si el
+# 404 persiste se considera ausencia genuina.
+MAX_404_RETRIES: int = 2
 
 # ── Timeframes objetivo (códigos internos) ────────────────────────────────
 # Usados cuando no se pasa --timeframes en el CLI.
@@ -38,10 +49,16 @@ PARQUET_COMPRESSION: str = "zstd"
 PARQUET_COMPRESSION_LEVEL: int = 1
 
 # ── HTTP client (httpx) — Fase 1 ─────────────────────────────────────────
-# HTTPX_MAX_CONNECTIONS debe coincidir o superar MAX_WORKERS para que cada
-# worker pueda tener su propia conexión TCP persistente sin contención.
-# Con 8 workers (default) y 16 conexiones hay margen para picos de concurrencia.
-HTTPX_MAX_CONNECTIONS: int = 16
+# CONCLUSIÓN EXPERIMENTAL (Teoría 1): el servidor datafeed.dukascopy.com
+# negocia HTTP/2 pero la conexión multiplexada se cae a mitad de transferencia
+# (httpx.ReadError).  HTTP/1.1 con keep-alive iguala el rendimiento sin ese
+# fallo.  HTTP2_ENABLED=False fuerza HTTP/1.1 en el cliente.
+HTTP2_ENABLED: bool = False
+
+# Con 4 workers basta un pool pequeño.  Mantener keepalive >= workers para que
+# cada worker reutilice su conexión TCP persistente (evita re-handshake TLS,
+# que era la única fuente de lentitud en el modo secuencial).
+HTTPX_MAX_CONNECTIONS: int = 8
 HTTPX_MAX_KEEPALIVE_CONNECTIONS: int = 8
 
 # Timeouts separados: connect cubre TCP + TLS handshake; read cubre la

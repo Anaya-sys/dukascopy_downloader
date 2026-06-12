@@ -1,0 +1,2 @@
+2026-06-12 23:17:28 | EURUSD | tick | 2026-06-07 16:00:00+00:00 | Falló la descarga de EURUSD/tick/2026-06-07 16:00:00+00:00 tras 3 intentos: Server error '503 Service Unavailable' for url 'https://datafeed.dukascopy.com/datafeed/EURUSD/2026/05/07/16h_ticks.bi5'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/503
