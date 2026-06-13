@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import List
 
-import requests
+import httpx
 
 log = logging.getLogger(__name__)
 
@@ -23,7 +23,7 @@ _META_URL = (
     "/master/src/utils/instrument-meta-data/generated/instrument-meta-data.json"
 )
 
-# FIX: se eliminó "m1" (era código muerto; m1 no es un timeframe seleccionable
+
 # y sólo se usa internamente como base de descarga para m15).
 _TF_START_KEY: dict[str, str] = {
     "tick": "startHourForTicks",
@@ -54,7 +54,7 @@ class GitHubScraper:
     def scrape(self) -> List[Instrument]:
         """Retorna una lista de todos los Instrument disponibles."""
         log.info("Obteniendo metadatos de instrumentos desde GitHub…")
-        resp = requests.get(_META_URL, timeout=self._timeout)
+        resp = httpx.get(_META_URL, timeout=self._timeout)
         resp.raise_for_status()
         raw: dict = resp.json()
 

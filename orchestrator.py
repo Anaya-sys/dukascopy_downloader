@@ -189,7 +189,21 @@ class DownloadOrchestrator:
 
     # ── Task builder ──────────────────────────────────────────────────────
 
-    def _build_tasks(self, instruments: List[Instrument], timeframes: list) -> List[Task]:
+    def _build_tasks(self, instruments: List[Instrument], timeframes: list,
+                     override_start_date: date | None = None) -> List[Task]:
+        """
+        Construye la lista de tareas de descarga.
+
+        override_start_date : si se da, se usa como fecha de inicio MÍNIMA para
+          cada (symbol, tf) cuyo checkpoint sea None o anterior a esa fecha.
+          Si el checkpoint ya es más reciente, el checkpoint sigue mandando.
+          Esto implementa el control DATE FROM de la UI.
+
+        Optimización de año: si override_start_date está en un año posterior al
+          año de inicio histórico del instrumento, saltamos directamente a
+          override_start_date (evita construir miles de tareas previas que luego
+          el orquestador tendría que ignorar por checkpoint vacío).
+        """
         today = datetime.now(timezone.utc).date()
         tasks: List[Task] = []
 
@@ -201,7 +215,17 @@ class DownloadOrchestrator:
                     continue
 
                 last = self._checkpoint.get_last_date(instr.symbol, tf)
-                start = (last + timedelta(days=1)) if last else instr.start_dates[primitive_tf]
+                if last:
+                    start = last + timedelta(days=1)
+                else:
+                    historical_start = instr.start_dates[primitive_tf]
+                    # Si el usuario fijó una fecha de inicio y es posterior al
+                    # inicio histórico del instrumento, saltamos directamente
+                    # al año del usuario (no generamos tareas de años anteriores).
+                    if override_start_date and override_start_date > historical_start:
+                        start = override_start_date
+                    else:
+                        start = historical_start
 
                 if start > today:
                     continue
@@ -358,9 +382,15 @@ class DownloadOrchestrator:
         raw = self._client.download_chunk(symbol, download_tf, dt)
         if raw is None:
             return
-        df = self._decoder.decode(raw, download_tf, factor, base_dt,
-                                  raw_prices=self._raw_prices)
-        del raw  # Bug E fix: liberar bytes comprimidos en TODOS los paths, incluso df vacío
+
+        # FIX BUG-6: _execute_ohlcv_month no usaba _decode_sem (inconsistencia con
+        # _execute_tick_day y _execute_ohlcv_day). Con 4 workers y chunks mensuales
+        # (los más grandes), los 4 podían decodificar simultáneamente anulando la
+        # protección de memoria del semáforo.
+        with self._decode_sem:
+            df = self._decoder.decode(raw, download_tf, factor, base_dt,
+                                      raw_prices=self._raw_prices)
+            del raw  # Bug E fix: liberar bytes comprimidos en TODOS los paths
         if df.empty:
             return
 

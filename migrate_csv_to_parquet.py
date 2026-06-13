@@ -700,6 +700,112 @@ def write_migration_log(results: list[dict], log_path: Path) -> None:
         )
 
 
+# ── Programmatic entry point (GUI) ─────────────────────────────────────────
+
+def migrate_all(
+    base: Path | str,
+    progress_callback=None,
+    symbol_filter: str | None = None,
+    decimal_factor: int | None = None,
+    dry_run: bool = False,
+) -> dict:
+    """
+    Migra todos los CSV bajo `base` a Parquet. Es la contraparte programática
+    de main(): mismo flujo (descubrir -> migrar -> escribir migration.log)
+    pero sin argparse ni sys.exit, y emitiendo progreso vía callback en lugar
+    de stdout -- pensado para invocarse desde la GUI (MIGRATE button).
+
+    Parameters
+    ----------
+    base            : directorio raíz de datos (igual a --base en CLI).
+    progress_callback : callable(str) invocado por cada línea de progreso
+                      (backend detectado, archivo procesado, resumen final).
+                      Si es None, las líneas se imprimen con print().
+    symbol_filter   : si se da, sólo migra ese símbolo (igual a --symbol).
+    decimal_factor  : override global del factor de escala (igual a
+                      --decimal-factor). None usa el mapping por símbolo.
+    dry_run         : si True, no escribe ningún archivo (igual a --dry-run).
+
+    Returns
+    -------
+    dict con claves: total, ok, errors, skipped, results, log_path.
+    `log_path` es None si no se encontraron archivos CSV (no se escribe log).
+
+    Raises
+    ------
+    FileNotFoundError : si `base` no existe.
+    ImportError       : si ni pyarrow ni polars están instalados.
+    """
+    def _emit(msg: str) -> None:
+        if progress_callback is not None:
+            progress_callback(msg)
+        else:
+            print(msg)
+
+    base = Path(base)
+    if not base.exists():
+        raise FileNotFoundError(f"El directorio base no existe: {base}")
+
+    backend = _detect_backend()
+    _emit(f"Backend de escritura Parquet: {backend}")
+
+    csv_files = _find_csv_files(base, symbol_filter)
+    if not csv_files:
+        _emit("No se encontraron archivos CSV en la estructura esperada.")
+        return {
+            "total": 0, "ok": 0, "errors": 0, "skipped": 0,
+            "results": [], "log_path": None,
+        }
+
+    _emit(f"Archivos CSV encontrados: {len(csv_files)}")
+    if dry_run:
+        _emit("Modo DRY-RUN activo: no se escribira ningun archivo.")
+
+    results: list[dict] = []
+    errors = 0
+
+    for csv_path in csv_files:
+        rel = csv_path.relative_to(base)
+        result = migrate_file(
+            csv_path=csv_path,
+            base=base,
+            factor_override=decimal_factor,
+            backend=backend,
+            dry_run=dry_run,
+        )
+        results.append(result)
+
+        status_icon = "OK" if result["status"] == "ok" else (
+            "DRY" if "dry_run" in result["status"] else
+            "SKIP" if "skip" in result["status"] else "ERR"
+        )
+        _emit(
+            f"  [{status_icon}] {rel}  "
+            f"({result['rows_in']} -> {result['rows_out']} filas)"
+            + (f"  ERROR: {result['error']}" if result["error"] else "")
+        )
+        if result["status"] == "error":
+            errors += 1
+
+    log_path = base / "migration.log"
+    write_migration_log(results, log_path)
+    _emit(f"Log de migracion escrito en: {log_path}")
+
+    ok_count = sum(1 for r in results if r["status"] == "ok")
+    _emit(f"Resumen: {ok_count}/{len(results)} archivos migrados correctamente.")
+    if errors:
+        _emit(f"{errors} archivo(s) con errores. Revisa {log_path}.")
+
+    return {
+        "total":   len(results),
+        "ok":      ok_count,
+        "errors":  errors,
+        "skipped": len(results) - ok_count - errors,
+        "results": results,
+        "log_path": log_path,
+    }
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────
 
 def main() -> None:
